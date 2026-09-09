@@ -1,5 +1,6 @@
 package si.unm.fis.pqcdemobankingapp.service;
 
+import si.unm.fis.pqcdemobankingapp.dto.PublicKeyResponse;
 import si.unm.fis.pqcdemobankingapp.dto.TransferResponse;
 import jakarta.annotation.PostConstruct;
 import org.bouncycastle.jcajce.spec.MLDSAParameterSpec;
@@ -11,27 +12,32 @@ import java.security.*;
 import java.util.Base64;
 
 /*
- This service registers the Bouncy Castle PQC provider,
- generates an ML-DSA-65 key pair at service startup,
- and provides methods for signing and verifying
- TransferResponse objects.
+ Registruje BC provajder, generiše ML-DSA-65 par ključeva pri startu servisa
+ i potpisuje/verifikuje TransferResponse objekte.
+
+ NAPOMENA: ovaj par ključeva je NEZAVISAN od ML-DSA-65 ključa u
+ keystore-pqc.p12 (koji se koristi za TLS sertifikat). Ovaj ovde je za
+ potpis na nivou aplikacije (integritet/autentičnost payload-a), TLS radi
+ svoj deo posla nezavisno. Ključ je efemeran — generiše se iznova pri
+ svakom pokretanju servera, zato klijent mora da ga preuzme preko
+ /api/v1/banking/public-key pre verifikacije.
 */
 
 @Service
 public class PqcSignatureService {
 
-    private static final String PROVIDER_NAME = "BC";
+    public static final String PROVIDER_NAME = "BC";
+    public static final String ALGORITHM = "ML-DSA-65";
+
     private KeyPair keyPair;
 
     @PostConstruct
     public void init() throws Exception {
-        // Registracija Bouncy Castle PQC provajdera ako već nije registrovan
         if (Security.getProvider(PROVIDER_NAME) == null) {
             Security.addProvider(new BouncyCastleProvider());
         }
 
-        // Generisanje ML-DSA-65 (FIPS 204) para ključeva
-        KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance("ML-DSA-65", PROVIDER_NAME);
+        KeyPairGenerator keyPairGenerator = KeyPairGenerator.getInstance(ALGORITHM, PROVIDER_NAME);
         keyPairGenerator.initialize(MLDSAParameterSpec.ml_dsa_65, new SecureRandom());
         this.keyPair = keyPairGenerator.generateKeyPair();
     }
@@ -42,47 +48,44 @@ public class PqcSignatureService {
      */
     public void signResponse(TransferResponse response) {
         try {
-            byte[] dataToSign = prepareCanonicalData(response);
+            byte[] dataToSign = canonicalize(response);
 
-            Signature signature = Signature.getInstance("ML-DSA-65", PROVIDER_NAME);
+            Signature signature = Signature.getInstance(ALGORITHM, PROVIDER_NAME);
             signature.initSign(this.keyPair.getPrivate());
             signature.update(dataToSign);
 
-            byte[] digitalSignature = signature.sign();
-            String base64Signature = Base64.getEncoder().encodeToString(digitalSignature);
-
-            response.setSignature(base64Signature);
+            response.setSignature(Base64.getEncoder().encodeToString(signature.sign()));
         } catch (Exception e) {
             throw new RuntimeException("Greška pri ML-DSA-65 potpisivanju odziva", e);
         }
     }
 
     /**
-     * Verifikuje da li je ML-DSA-65 potpis na TransferResponse objektu validan.
+     * Verifikacija sopstvenim (server-side) javnim ključem — korisno za self-test.
      */
     public boolean verifyResponse(TransferResponse response) {
-        if (response.getSignature() == null || response.getSignature().isEmpty()) {
-            return false;
-        }
+        return verify(response, this.keyPair.getPublic());
+    }
 
-        try {
-            byte[] dataToVerify = prepareCanonicalData(response);
-            byte[] signatureBytes = Base64.getDecoder().decode(response.getSignature());
+    public PublicKeyResponse getPublicKeyInfo() {
+        PublicKey pk = this.keyPair.getPublic();
+        return new PublicKeyResponse(
+                pk.getAlgorithm(),
+                pk.getFormat(),
+                Base64.getEncoder().encodeToString(pk.getEncoded())
+        );
+    }
 
-            Signature signature = Signature.getInstance("ML-DSA-65", PROVIDER_NAME);
-            signature.initVerify(this.keyPair.getPublic());
-            signature.update(dataToVerify);
-
-            return signature.verify(signatureBytes);
-        } catch (Exception e) {
-            return false;
-        }
+    public PublicKey getPublicKey() {
+        return keyPair.getPublic();
     }
 
     /**
-     * Konvertuje polja DTO objekta u deterministički determinisan string za potpisivanje.
+     * Deterministički kanonski oblik podataka koji se potpisuje/verifikuje.
+     * Static i public da bi je benchmark klijent mogao ponovo koristiti
+     * bez duplirane (i potencijalno divergentne) implementacije.
      */
-    private byte[] prepareCanonicalData(TransferResponse response) {
+    public static byte[] canonicalize(TransferResponse response) {
         String payload = String.format("%s|%s|%s|%s|%s|%s|%s",
                 response.getTransactionId(),
                 response.getStatus(),
@@ -95,7 +98,26 @@ public class PqcSignatureService {
         return payload.getBytes(StandardCharsets.UTF_8);
     }
 
-    public PublicKey getPublicKey() {
-        return keyPair.getPublic();
+    /**
+     * Static verifikacija nad proizvoljnim javnim ključem — ovu koristi
+     * benchmark klijent, pošto on nema pristup serverovom internom KeyPair-u,
+     * već samo javnom ključu preuzetom preko /public-key endpointa.
+     */
+    public static boolean verify(TransferResponse response, PublicKey publicKey) {
+        if (response.getSignature() == null || response.getSignature().isEmpty()) {
+            return false;
+        }
+        try {
+            byte[] dataToVerify = canonicalize(response);
+            byte[] signatureBytes = Base64.getDecoder().decode(response.getSignature());
+
+            Signature signature = Signature.getInstance(ALGORITHM, PROVIDER_NAME);
+            signature.initVerify(publicKey);
+            signature.update(dataToVerify);
+
+            return signature.verify(signatureBytes);
+        } catch (Exception e) {
+            return false;
+        }
     }
 }
