@@ -48,7 +48,7 @@ public class DirectPqcClientTest {
             SSLContext sslContext = SSLContext.getInstance("TLSv1.3", "BCJSSE");
             sslContext.init(null, trustAll, new java.security.SecureRandom());
 
-            URL url = new URL("https://localhost:8443/api/v1/bank/transaction");
+            URL url = new URL("https://localhost:8443/api/v1/bank/pera");
             HttpsURLConnection connection = (HttpsURLConnection) url.openConnection();
 
             // Postavljamo BCJSSE Socket Factory i HostnameVerifier
